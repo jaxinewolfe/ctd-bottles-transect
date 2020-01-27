@@ -1,0 +1,260 @@
+---
+title: "CTD and Bottle Product Comparison"
+output: html_document
+---
+
+## Setup 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# clear workspace for local development
+rm(list = ls())
+
+# assign relative path to directory
+dir <- "/Users/jaxinewolfe/Documents/WHOI/NESLTER/ctd-bottles-transect/"
+# set as working directory
+setwd(dir)
+
+# define R packages to require
+libs <- c("tidyverse", "maps")
+# load libraries
+lapply(libs, require, character.only = TRUE)
+```
+
+## Utility Function: Read From API
+```{r}
+
+# Read in files from the REST API
+# accepts the type of data (ctd metadata, bottle summary, chl, nut)
+# accepts a vector of cruises to compile data from
+
+read_from_api <- function(type, cruises) {
+  # expand the cruises into a dataframe (avoids nested for loops)
+  z <- expand.grid(cruises)
+  
+  # read in data based on the specified source
+  if (type == "metadata") {
+    urls <- paste0("https://nes-lter-data.whoi.edu/api/ctd/", z$Var1, "/metadata.csv")
+    urls <- unlist(urls)
+  }
+  if (type == "summary") {
+    urls <- paste0("https://nes-lter-data.whoi.edu/api/ctd/", z$Var1, "/bottle_summary.csv")
+    urls <- unlist(urls)
+  }
+  if (type == "nutrient") {
+    urls <- paste0("https://nes-lter-data.whoi.edu/api/nut/", z$Var1, ".csv")
+    urls <- unlist(urls)
+  }
+  if (type == "chl") {
+    urls <- paste0("https://nes-lter-data.whoi.edu/api/chl/", z$Var1, ".csv")
+    urls <- unlist(urls)
+  }
+  if (type == "bottles") {
+    urls <- paste0("https://nes-lter-data.whoi.edu/api/ctd/", z$Var1, "/bottles.csv")
+    urls <- unlist(urls)
+  }
+
+  ## Cruise Compilation ##
+  # case: more than one cruise given
+  if (length(cruises) > 1) {
+  # begin compilation  
+  prev_cruise <- read_csv(urls[1])
+  
+  # loop through urls to compile cruise data into one file
+  for (k in 2:length(urls)){
+    # read in data per cruise
+    next_cruise <- read_csv(urls[k])
+    
+    # bind the next cruise to the compiled cruise dataset
+    all <- plyr::rbind.fill(prev_cruise, next_cruise)
+    
+    # if statment to reset the previous cruises until all cruises are read in
+    if(k < length(urls)) {
+      prev_cruise <- all
+    }
+  }
+  return(all)
+
+  # case: only one cruise is given
+  } else {
+   all <- read_csv(urls)
+   return(all)
+  }
+}
+
+```
+
+## Utility Function: Find Paired Casts
+```{r}
+
+# packages required: tidyverse
+
+find_paired_casts <- function(df, min.time) {
+  
+  cruiselist <- unique(df$cruise)
+  # read in ctd data
+  ctd_metadata <- read_from_api(type = "metadata", cruises = cruiselist)
+  ctd_summary <- read_from_api(type = "summary", cruises = cruiselist)
+
+  # define column to display paired cast
+  df$paired_cast <- NA_character_
+  
+  for (j in 1:nrow(df)) {
+    # store values for current row
+    df_cruise <- df$cruise[j]
+    df_cast <- df$cast[j]
+    
+    # isolate cast metadata and bottle summary
+    cast_metadata <- ctd_metadata %>% filter(cruise == df_cruise & cast == df_cast)
+    cast_summary <- ctd_summary %>% filter(cruise == df_cruise & cast == df_cast)
+    
+    # define the min and max time for the cast 
+    df_date_max <- max(cast_summary$date)
+    df_date_min <- min(cast_summary$date)
+    
+    # find the cast before from the bottle summary
+    cast_before <- ctd_summary %>% 
+      filter(cruise == df_cruise & cast == (df_cast-1))
+    # find the cast after from the ctd metadata
+    cast_after <- ctd_metadata %>% 
+      filter(cruise == df_cruise & cast == (df_cast+1))
+    
+    # deterine the time difference
+    time_before <- min(abs(as.numeric(difftime(df_date_min, cast_before$date, units = "mins"))),
+                       na.rm = TRUE)
+    time_after <- min(abs(as.numeric(difftime(df_date_max, cast_after$date, units = "mins"))),
+                      na.rm = TRUE)
+    
+    # determine paired casts if they exist
+    if (time_after > min.time & time_before > min.time) {
+      j <- j + 1
+      next
+    }
+    if (time_before < min.time) {
+      # isolate cast metadata to extract station
+      before_metadata <- ctd_metadata %>% filter(cruise == df_cruise & cast == (df_cast-1))
+      if (isFALSE(cast_metadata$nearest_station == before_metadata$nearest_station)) {
+        print(paste0("paired cast found for cruise ", df_cruise, 
+                     " and cast ", df_cast, ", but nearest station did not match"))
+        j <- j + 1
+        next
+      } else {
+        df$paired_cast[j] <- df_cast - 1
+      }
+    }
+    if (time_after < min.time) {
+      if (isFALSE(cast_metadata$nearest_station == cast_after$nearest_station)) {
+        print(paste0("paired cast found for cruise ", df_cruise, 
+                     " and cast ", df_cast, ", but nearest station did not match"))
+        j <- j + 1
+        next
+      } else {
+        df$paired_cast[j] <- df_cast + 1
+      }
+    }
+  }
+  return(df)
+}
+
+# Example code
+# test_df <- find_paired_casts(df, min.time = 50)
+
+```
+
+
+## Compare Cast Function
+
+Cruises with up and downcast CTD profiles:
+  • ar31b (bin-averaged)
+  • ar32 (bin-averaged)
+  • ar34b (not bin-averaged)
+  • en644 (api doesn't display upcast)
+
+CTD bottle data provides a list of niskins along with data from the CTD as it has been provided by the SeaBird CTD processing software. CTD cast provides profiles for each specified cast. Bottle summaries only have the upcast. The goal is to relate the datasets based on depth (depsm) or pressure (prdm) and compare across temperature (t090c) and salinity (sal00). 
+
+Function to write: compare_cast(cruise, castnum) 
+  • input desired cast and cruise number
+  
+  From bottle summary:
+  • pulls appropriate CTD and truncates it with the upcast function 
+  • pulls bottle summary for given cruise and truncates the dataset to the given castnum
+  
+  Comparison:
+  • use nearest pressure to compare temp and salinity between the two tables
+  • add columns that indicate logical and numerical difference in the values
+  
+```{r}
+
+# function returns the upcast for a given CTD dataset
+upcast <- function(dataset, depth_col){
+  # find the max depth
+  ind <- which.max(dataset[[depth_col]])
+  # return upcast
+  return(dataset[ind:nrow(dataset),])
+}
+
+# compare CTD profiles and bottle summary for a specified cruise and cast
+compare_cast <- function(cruise, castnum) {
+  
+  # load bottle summary
+  bottle <- read_from_api(type = "bottles", cruises = cruise) %>%
+    filter(cast == castnum) %>%
+    select(depsm, prdm, t090c, sal00)
+
+  # load ctd profile
+  # https://nes-lter-data.whoi.edu/api/ctd/en617/cast_12.csv
+  ctd <- read_csv(paste0("https://nes-lter-data.whoi.edu/api/ctd/", cruise, "/cast_", castnum, ".csv")) %>%
+    select(depsm, prdm, t090c, sal00)
+
+  # isolate upcast from the ctd profile
+  ctd_upcast <- upcast(ctd, depth_col = "depsm")
+  
+  # define fields for logical and numerical comparisons
+  bottle$sal_check <- FALSE
+  bottle$sal_diff <- NA_integer_
+  bottle$temp_check <- FALSE
+  bottle$temp_diff <- NA_integer_
+
+  for (i in 1:nrow(bottle)) {
+    # store values
+    bottle_prdm <- bottle$prdm[i]
+    # bottle_depsm <- bottle$depsm[i] # using prdm to merge for now
+    bottle_sal <- bottle$sal00[i]
+    bottle_temp <-bottle$t090c[i]
+  
+    # find the index of the nearest datetime
+    ind <- which.min(abs(bottle_prdm - ctd_upcast$prdm))
+    
+    # store sal and temp at closest pressure
+    ctd_sal <- ctd_upcast$sal00[ind]
+    ctd_temp <- ctd_upcast$t090c[ind]
+  
+    # logical salinity comparison 
+    if (round(bottle_sal,2) == round(ctd_sal,2)) {
+      bottle$sal_check[i] <- TRUE
+    } 
+    # logical temp comparison 
+    if (round(bottle_temp,2) == round(ctd_temp,2)) {
+      bottle$temp_check[i] <- TRUE
+    } 
+    
+    # store differences
+    bottle$sal_diff[i] <- abs(bottle_sal - ctd_sal)
+    bottle$temp_diff[i] <- abs(bottle_temp - ctd_temp)
+  }
+  return(bottle)
+  }
+
+```
+
+## Compare CTD cast and bottles data
+
+The data displayed will be from the bottle summary. Function adds columns displaying the logical and numerical check for temp and salinity. 
+```{r}
+
+# load metadata
+# metadata_ar31b <- read_from_api(type = "metadata", cruises = "ar31b")
+
+compare_ar31b_6 <- compare_cast("ar31b", castnum = 6)
+
+```
